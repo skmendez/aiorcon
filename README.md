@@ -1,2 +1,2 @@
 # aiohttp
-Asynchronous Interface for the Source RCON Protocol
+An asynchronous interface for the Source RCON Protocol.
