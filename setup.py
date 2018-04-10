@@ -2,8 +2,8 @@ from distutils.core import setup
 
 setup(
     name='aiorcon',
-    version='0.1.0',
-    packages=[''],
+    version='0.1.1',
+    packages=['aiorcon'],
     url='github.com/Sebass13/aiorcon',
     license='GPL-3.0',
     author='Sebastian',
