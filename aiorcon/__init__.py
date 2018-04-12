@@ -1,10 +1,8 @@
-__version__ = '0.1.2'
-
 import struct
 import asyncio
 import enum
 import functools
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 
 
 class RCONError(Exception):
@@ -126,12 +124,12 @@ class RCONMessage(object):
         return cls(id_, type_, body), remainder
 
     @classmethod
-    def terminator(cls):
+    def terminator(cls, id_):
         """Message which follows a EXECCOMMAND to make the server send
         the terminating responses.
         :returns: an :class:`RCONMessage` which represents an empty
             ``RESPONSE_VALUE``"""
-        return cls(0, cls.Type.RESPONSE_VALUE, b"")
+        return cls(id_, cls.Type.RESPONSE_VALUE, b"")
 
 
 class _ResponseBuffer(object):
@@ -145,19 +143,13 @@ class _ResponseBuffer(object):
     https://developer.valvesoftware.com/wiki/RCON#Multiple-packet_Responses
     .. note::
         Multi-part responses are only applicable to ``EXECCOMAND`` requests.
-    In addition to handling multi-part responses transparently this class
-    provides the ability to :meth:`discard` incoming messages. When a
-    message is discarded it will be parsed from the buffer but then
-    silently dropped, meaning it cannot be retrieved via :meth:`pop`.
-    Message discarding works with multi-responses but it only applies to
-    the complete response, not the constituent parts.
     """
+    PARTIAL_RESPONSE_CAP = 4096  # Value at which partial responses are pruned
 
     def __init__(self):
         self._buffer = b""
         self.responses = OrderedDict()
-        self._partial_responses = []
-        self._discard_count = 0
+        self._partial_responses = defaultdict(list)
 
     def pop(self, id_=None):
         """Pop first received message from the buffer, or the message
@@ -168,19 +160,18 @@ class _ResponseBuffer(object):
         if not self.responses:
             raise RCONError("Response buffer is empty")
         if id_ is None:
-            return self.responses.popitem[1]
+            return self.responses.popitem()[1]
         else:
             return self.responses.pop(id_)
 
     def clear(self):
         """Clear the buffer.
-        This clears the byte buffer, response buffer, partial response
-        buffer and the discard counter.
+        This clears the byte buffer, response buffer,  and partial response
+        buffer.
         """
         self._buffer = b""
         self.responses.clear()
-        del self._partial_responses[:]
-        self._discard_count = 0
+        self._partial_responses.clear()
 
     def _consume(self):
         """Attempt to parse buffer into responses.
@@ -193,19 +184,20 @@ class _ResponseBuffer(object):
                 return
             else:
                 if message.type is message.Type.RESPONSE_VALUE:
-                    self._partial_responses.append(message)
-                    if len(self._partial_responses) >= 2:
-                        penultimate, last = self._partial_responses[-2:]
+                    id_partial = self._partial_responses[message.id]
+                    id_partial.append(message)
+                    if len(id_partial) >= 2:
+                        penultimate, last = id_partial[-2:]
                         if (not penultimate.body
                                 and last.body == b"\x00\x01\x00\x00"):
                             message = RCONMessage(
-                                self._partial_responses[0].id,
+                                message.id,
                                 RCONMessage.Type.RESPONSE_VALUE,
                                 b"".join(part.body for part
-                                         in self._partial_responses[:-2]),
+                                         in id_partial[:-2]),
                             )
                             self.responses[message.id] = message
-                            del self._partial_responses[:]
+                            del id_partial[:]
                 else:
                     self.responses[message.id] = message
 
@@ -213,9 +205,12 @@ class _ResponseBuffer(object):
         """Feed bytes into the buffer."""
         self._buffer += bytes_
         self._consume()
+        for response_list in self._partial_responses.values():
+            if len(response_list) > _ResponseBuffer.PARTIAL_RESPONSE_CAP:
+                del response_list[:]
 
 
-def _ensure(state, value=True):  # pylint: disable=no-self-argument
+def _ensure(state, value=True):
     """Decorator to ensure a connection is in a specific state.
     Use this to wrap a method so that it'll only be executed when
     certain attributes are set to ``True`` or ``False``. The returned
@@ -234,7 +229,7 @@ def _ensure(state, value=True):  # pylint: disable=no-self-argument
             if getattr(instance, state) is not value:
                 exc = RCONError("Must {} {}".format(
                     "be" if value else "not be", state))
-                if instance.exc:
+                if hasattr(instance, 'exc'):
                     exc.__cause__ = instance.exc
                 raise exc
             return func(instance, *args, **kwargs)
@@ -247,37 +242,40 @@ def _ensure(state, value=True):  # pylint: disable=no-self-argument
 
     return decorator
 
+
 class RCONProtocol(asyncio.Protocol):
     """Implements the RCON protocol"""
 
-    def __init__(self, password, loop, timeout=3):
+    def __init__(self, password, loop, timeout=3, connection_lost_cb=None):
         self.password = password
         self.connected = False
         self.authenticated = False
         self.timeout = timeout
+        self._connection_lost_cb = connection_lost_cb
         self._loop = loop
         self._transport = None
         self.exc = None
         self._waiters = {}
         self._buffer = _ResponseBuffer()
-        self._reqid = 0
+        self._last_id = 0
+        self.test = 0
 
     @property
-    def reqid(self):
-        return self._reqid
+    def last_id(self):
+        return self._last_id
 
-    @reqid.setter
-    def reqid(self, value):
-        self._reqid = (value - 1) % (2**31 - 1) + 1  # Keep values between 1 and 2**31-1
+    @last_id.setter
+    def last_id(self, value):
+        self._last_id = (value - 1) % (2 ** 31 - 1) + 1  # Keep values between 1 and 2**31-1
 
     @_ensure('connected')
     @_ensure('authenticated')
     async def execute(self, command):
         """Executes command on connected RCON"""
-        self.reqid += 1
-        message = RCONMessage(self.reqid, RCONMessage.Type.EXECCOMMAND, command)
+        self.last_id += 1
+        message = RCONMessage(self.last_id, RCONMessage.Type.EXECCOMMAND, command)
         self._write(message)
-        self._write(RCONMessage.terminator())
+        self._write(RCONMessage.terminator(self.last_id))
         res = await self._receive(message.id)
         return res.text
 
@@ -321,6 +319,10 @@ class RCONProtocol(asyncio.Protocol):
     def connection_lost(self, exc):
         self.connected = False
         self.exc = exc
+        if self._connection_lost_cb:
+            res = self._connection_lost_cb(self)
+            if asyncio.iscoroutine(res):
+                self._loop.create_task(res)
 
     def data_received(self, data):
         self._buffer.feed(data)
