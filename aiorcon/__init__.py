@@ -3,34 +3,8 @@ import asyncio
 import enum
 import functools
 from collections import OrderedDict, defaultdict
-
-
-class RCONError(Exception):
-    """Base exception for all RCON-related errors."""
-
-
-class RCONCommunicationError(RCONError):
-    """Used for propagating socket-related errors."""
-
-
-class RCONTimeoutError(RCONError):
-    """Raised when a timeout occurs waiting for a response."""
-
-
-class RCONAuthenticationError(RCONError):
-    """Raised for failed authentication.
-    :ivar bool banned: signifies whether the authentication failed due to
-        being banned or for merely providing the wrong password.
-    """
-
-    def __init__(self, banned=False):
-        super(RCONError, self).__init__(
-            "Banned" if banned else "Wrong password")
-        self.banned = banned
-
-
-class RCONMessageError(RCONError):
-    """Raised for errors encoding or decoding RCON messages."""
+from .exceptions import *
+__version__ = '0.2.0'
 
 
 class RCONMessage(object):
@@ -284,10 +258,11 @@ class RCONProtocol(asyncio.Protocol):
     async def authenticate(self):
         """Authenticates with RCON"""
         self._write(RCONMessage(0, RCONMessage.Type.AUTH, self.password))
-        possible_reponses = (self._receive(0), self._receive(-1))
-        done_task, pending_task = await asyncio.wait(possible_reponses, return_when=asyncio.FIRST_COMPLETED)
-        pending_task.pop().cancel()
-        res = done_task.pop().result()
+        try:
+            res = await self._receive()
+        except ConnectionResetError as e:
+            raise RCONAuthenticationError(True)
+
         self._buffer.clear()
         if res.id == -1:
             raise RCONAuthenticationError
@@ -302,13 +277,13 @@ class RCONProtocol(asyncio.Protocol):
     def _write(self, message):
         self._transport.write(message.encode())
 
-    async def _receive(self, id_):
+    async def _receive(self, id_=None):
         self._waiters[id_] = self._loop.create_future()
         try:
-            await self._waiters[id_]
+            await asyncio.wait_for(self._waiters[id_], timeout=self.timeout)
             return self._buffer.pop(id_)
-        except asyncio.CancelledError:
-            return
+        except Exception:
+            raise
         finally:
             del self._waiters[id_]
 
@@ -319,17 +294,27 @@ class RCONProtocol(asyncio.Protocol):
     def connection_lost(self, exc):
         self.connected = False
         self.exc = exc
+        for waiter in self._waiters.values():
+            if exc:
+                waiter.set_exception(exc)
+            else:
+                waiter.cancel()
         if self._connection_lost_cb:
             res = self._connection_lost_cb(self)
             if asyncio.iscoroutine(res):
                 self._loop.create_task(res)
 
     def data_received(self, data):
+        cur_count = len(self._buffer.responses)
         self._buffer.feed(data)
         for id_, waiter in self._waiters.items():
-            if id_ in self._buffer.responses:
-                if not waiter.cancelled():
+            if id_ is None:
+                if len(self._buffer.responses) > cur_count:
                     waiter.set_result(None)
+            else:
+                if id_ in self._buffer.responses:
+                    if not waiter.cancelled():
+                        waiter.set_result(None)
 
     @classmethod
     async def new_connection(cls, host, port, password, loop, timeout=3):
@@ -340,3 +325,4 @@ class RCONProtocol(asyncio.Protocol):
             raise RCONCommunicationError("Connecting to server failed") from cause
         await protocol.authenticate()
         return protocol
+
