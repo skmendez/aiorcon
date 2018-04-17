@@ -4,7 +4,7 @@ import enum
 import functools
 from collections import OrderedDict, defaultdict
 from .exceptions import *
-__version__ = '0.2.1'
+__version__ = '0.2.2'
 
 
 class RCONMessage(object):
