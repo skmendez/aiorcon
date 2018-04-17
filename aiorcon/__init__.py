@@ -4,7 +4,7 @@ import enum
 import functools
 from collections import OrderedDict, defaultdict
 from .exceptions import *
-__version__ = '0.2.2'
+__version__ = '0.3.0'
 
 
 class RCONMessage(object):
@@ -223,7 +223,7 @@ class RCONProtocol(asyncio.Protocol):
     def __init__(self, password, loop, timeout=3, connection_lost_cb=None):
         self.password = password
         self.connected = False
-        self.authenticated = False
+        self._authenticated = False
         self.timeout = timeout
         self._connection_lost_cb = connection_lost_cb
         self._loop = loop
@@ -241,6 +241,10 @@ class RCONProtocol(asyncio.Protocol):
     @last_id.setter
     def last_id(self, value):
         self._last_id = (value - 1) % (2 ** 31 - 1) + 1  # Keep values between 1 and 2**31-1
+
+    @property
+    def authenticated(self):
+        return self._authenticated and self.connected
 
     @_ensure('connected')
     @_ensure('authenticated')
@@ -266,9 +270,8 @@ class RCONProtocol(asyncio.Protocol):
         self._buffer.clear()
         if res.id == -1:
             raise RCONAuthenticationError
-        self.authenticated = True
+        self._authenticated = True
 
-    @_ensure('connected')
     def close(self):
         """Closes RCON connection"""
         self._transport.close()
@@ -316,13 +319,58 @@ class RCONProtocol(asyncio.Protocol):
                     if not waiter.cancelled():
                         waiter.set_result(None)
 
-    @classmethod
-    async def new_connection(cls, host, port, password, loop, timeout=3):
-        fut = loop.create_connection(lambda: cls(password, loop, timeout), host, port)
+
+class RCON:
+    def __init__(self, host, port, password, timeout=3, autoreconnect_attempts=0, loop=None):
+        self.autoreconnect_attempts = autoreconnect_attempts
+        if loop is None:
+            loop = asyncio.get_event_loop()
+        self._loop = loop
+        self._host = host
+        self._port = port
+        self._password = password
+        self._timeout = timeout
+        self._creating_connection = None
+        self._new_connection()
+        self.exception = None
+
+    def _new_connection(self):
+        fut = self._loop.create_connection(lambda: RCONProtocol(self._password,
+                                                                self._loop,
+                                                                self._timeout,
+                                                                self.autoreconnect),
+                                           self._host,
+                                           self._port)
+        self._creating_connection = asyncio.wait_for(fut, self._timeout)
+
+    async def __aenter__(self):
+        return await self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self.protocol.close()
+
+    def __await__(self):
         try:
-            _, protocol = await asyncio.wait_for(fut, timeout, loop=loop)
+            _, protocol = yield from self._creating_connection
         except Exception as cause:
             raise RCONCommunicationError("Connecting to server failed") from cause
-        await protocol.authenticate()
-        return protocol
+        yield from protocol.authenticate().__await__()
+        self.protocol = protocol
+        return self
 
+    async def __call__(self, command):
+        return await self.protocol.execute(command)
+
+    async def autoreconnect(self, exc):
+        attempts = self.autoreconnect_attempts
+        while attempts and not self.protocol.authenticated:
+            if attempts > 0:
+                attempts -= 1
+            try:
+                self._new_connection()
+                await self
+            except (asyncio.TimeoutError, RCONCommunicationError) as e:
+                if attempts:
+                    await asyncio.sleep(5)
+                else:
+                    self.exception = e
