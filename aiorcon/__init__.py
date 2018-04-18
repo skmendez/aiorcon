@@ -4,7 +4,7 @@ import enum
 import functools
 from collections import OrderedDict, defaultdict
 from .exceptions import *
-__version__ = '0.3.0'
+__version__ = '0.4.0'
 
 
 class RCONMessage(object):
@@ -220,11 +220,10 @@ def _ensure(state, value=True):
 class RCONProtocol(asyncio.Protocol):
     """Implements the RCON protocol"""
 
-    def __init__(self, password, loop, timeout=3, connection_lost_cb=None):
+    def __init__(self, password, loop, connection_lost_cb=None):
         self.password = password
         self.connected = False
         self._authenticated = False
-        self.timeout = timeout
         self._connection_lost_cb = connection_lost_cb
         self._loop = loop
         self._transport = None
@@ -264,7 +263,7 @@ class RCONProtocol(asyncio.Protocol):
         self._write(RCONMessage(0, RCONMessage.Type.AUTH, self.password))
         try:
             res = await self._receive()
-        except ConnectionResetError as e:
+        except ConnectionResetError:
             raise RCONAuthenticationError(True)
 
         self._buffer.clear()
@@ -283,10 +282,8 @@ class RCONProtocol(asyncio.Protocol):
     async def _receive(self, id_=None):
         self._waiters[id_] = self._loop.create_future()
         try:
-            await asyncio.wait_for(self._waiters[id_], timeout=self.timeout)
+            await self._waiters[id_]
             return self._buffer.pop(id_)
-        except Exception:
-            raise
         finally:
             del self._waiters[id_]
 
@@ -303,9 +300,7 @@ class RCONProtocol(asyncio.Protocol):
             else:
                 waiter.cancel()
         if self._connection_lost_cb:
-            res = self._connection_lost_cb(self)
-            if asyncio.iscoroutine(res):
-                self._loop.create_task(res)
+            self._connection_lost_cb()
 
     def data_received(self, data):
         cur_count = len(self._buffer.responses)
@@ -321,56 +316,65 @@ class RCONProtocol(asyncio.Protocol):
 
 
 class RCON:
-    def __init__(self, host, port, password, timeout=3, autoreconnect_attempts=0, loop=None):
-        self.autoreconnect_attempts = autoreconnect_attempts
-        if loop is None:
-            loop = asyncio.get_event_loop()
-        self._loop = loop
-        self._host = host
-        self._port = port
-        self._password = password
-        self._timeout = timeout
-        self._creating_connection = None
-        self._new_connection()
-        self.exception = None
+    @classmethod
+    async def create(cls, host, port, password, loop=None, auto_reconnect_attempts=-1, auto_reconnect_delay=5):
+        rcon = cls()
+        rcon.host = host
+        rcon.port = port
+        rcon._loop = loop or asyncio.get_event_loop()
+        rcon._auto_reconnect_attempts = auto_reconnect_attempts
+        rcon._auto_reconnect_delay = auto_reconnect_delay
+        rcon._creating_connection = None
+        rcon._reconnecting = False
+        rcon._closing = False
 
-    def _new_connection(self):
-        fut = self._loop.create_connection(lambda: RCONProtocol(self._password,
-                                                                self._loop,
-                                                                self._timeout,
-                                                                self.autoreconnect),
-                                           self._host,
-                                           self._port)
-        self._creating_connection = asyncio.wait_for(fut, self._timeout)
+        def connection_lost():
+            if rcon._auto_reconnect_attempts and not rcon._closing:
+                rcon._reconnecting = asyncio.ensure_future(rcon._reconnect(), loop=rcon._loop)
 
-    async def __aenter__(self):
-        return await self
+        rcon.protocol_factory = lambda: RCONProtocol(password=password, loop=loop,
+                                     connection_lost_cb=connection_lost)
+        rcon.protocol = None
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        self.protocol.close()
+        await rcon._reconnect()
+        return rcon
 
-    def __await__(self):
-        try:
-            _, protocol = yield from self._creating_connection
-        except Exception as cause:
-            raise RCONCommunicationError("Connecting to server failed") from cause
-        yield from protocol.authenticate().__await__()
-        self.protocol = protocol
-        return self
-
-    async def __call__(self, command):
-        return await self.protocol.execute(command)
-
-    async def autoreconnect(self, exc):
-        attempts = self.autoreconnect_attempts
-        while attempts and not self.protocol.authenticated:
-            if attempts > 0:
+    async def _reconnect(self):
+        attempts = self._auto_reconnect_attempts
+        while attempts:
+            if self._auto_reconnect_attempts > 0:
                 attempts -= 1
             try:
-                self._new_connection()
-                await self
-            except (asyncio.TimeoutError, RCONCommunicationError) as e:
-                if attempts:
-                    await asyncio.sleep(5)
-                else:
-                    self.exception = e
+                _, protocol = await self._loop.create_connection(self.protocol_factory, self.host, self.port)
+                await protocol.authenticate()
+                self.protocol = protocol
+                return
+            except OSError as e:
+                print(repr(e))
+                if attempts == 0:
+                    raise
+                await asyncio.sleep(self._auto_reconnect_delay)
+
+    async def __call__(self, command):
+        try:
+            return await self.protocol.execute(command)
+        except OSError as e:
+            if self._reconnecting:
+                await self._reconnecting
+                return await self(command)
+            else:
+                raise
+
+    def __getattr__(self, name):
+        return getattr(self.protocol, name)
+
+    def __repr__(self):
+        return 'RCON(host=%r, port=%r, password=%r)' % (self.host, self.port, self.password)
+
+    def close(self):
+        """
+        Close the connection transport
+        """
+        self._closing = True
+        self.protocol.close()
+
