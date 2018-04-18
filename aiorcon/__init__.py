@@ -4,7 +4,7 @@ import enum
 import functools
 from collections import OrderedDict, defaultdict
 from .exceptions import *
-__version__ = '0.4.0'
+__version__ = '0.4.1'
 
 
 class RCONMessage(object):
@@ -298,7 +298,7 @@ class RCONProtocol(asyncio.Protocol):
             if exc:
                 waiter.set_exception(exc)
             else:
-                waiter.cancel()
+                waiter.set_exception(ConnectionAbortedError)
         if self._connection_lost_cb:
             self._connection_lost_cb()
 
@@ -333,11 +333,16 @@ class RCON:
                 rcon._reconnecting = asyncio.ensure_future(rcon._reconnect(), loop=rcon._loop)
 
         rcon.protocol_factory = lambda: RCONProtocol(password=password, loop=loop,
-                                     connection_lost_cb=connection_lost)
+                                                     connection_lost_cb=connection_lost)
         rcon.protocol = None
 
-        await rcon._reconnect()
+        await rcon._connect()
         return rcon
+
+    async def _connect(self):
+        _, protocol = await self._loop.create_connection(self.protocol_factory, self.host, self.port)
+        await protocol.authenticate()
+        self.protocol = protocol
 
     async def _reconnect(self):
         attempts = self._auto_reconnect_attempts
@@ -345,12 +350,9 @@ class RCON:
             if self._auto_reconnect_attempts > 0:
                 attempts -= 1
             try:
-                _, protocol = await self._loop.create_connection(self.protocol_factory, self.host, self.port)
-                await protocol.authenticate()
-                self.protocol = protocol
+                await self._connect()
                 return
             except OSError as e:
-                print(repr(e))
                 if attempts == 0:
                     raise
                 await asyncio.sleep(self._auto_reconnect_delay)
