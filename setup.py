@@ -14,7 +14,7 @@ setup(
     author_email='sebikele@gmail.com',
     description='An asynchronous interface for the Source RCON Protocol.',
     classifiers=(
-        'Development Status :: 3 - Alpha',
+        'Development Status :: 4 - Beta',
         'Framework :: AsyncIO',
         'Intended Audience :: Developers',
         'Natural Language :: English',

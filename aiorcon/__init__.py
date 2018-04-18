@@ -4,7 +4,7 @@ import enum
 import functools
 from collections import OrderedDict, defaultdict
 from .exceptions import *
-__version__ = '0.4.1'
+__version__ = '0.5.0'
 
 
 class RCONMessage(object):
@@ -360,7 +360,9 @@ class RCON:
     async def __call__(self, command):
         try:
             return await self.protocol.execute(command)
-        except OSError as e:
+        except RCONAuthenticationError:
+            raise
+        except (OSError, RCONError):
             if self._reconnecting:
                 await self._reconnecting
                 return await self(command)
