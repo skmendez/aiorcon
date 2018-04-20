@@ -2,9 +2,10 @@ import struct
 import asyncio
 import enum
 import functools
+import operator
 from collections import OrderedDict, defaultdict
 from .exceptions import *
-__version__ = '0.5.0'
+__version__ = '0.6.0'
 
 
 class RCONMessage(object):
@@ -33,8 +34,19 @@ class RCONMessage(object):
         return ("<{0.__class__.__name__} "
                 "{0.id} {0.type.name} {1}B>").format(self, len(self.body))
 
+    def __str__(self):
+        return self.text
+
     def __bytes__(self):
         return self.encode()
+
+    def __add__(self, other):
+        if self.id != other.id:
+            raise ValueError("IDs must be equal")
+        if self.type != other.type:
+            raise ValueError("Message type must be equal")
+
+        return RCONMessage(self.id, self.type, self.body + other.body)
 
     @property
     def text(self):
@@ -120,10 +132,11 @@ class _ResponseBuffer(object):
     """
     PARTIAL_RESPONSE_CAP = 4096  # Value at which partial responses are pruned
 
-    def __init__(self):
+    def __init__(self, multiple_packet=True):
         self._buffer = b""
         self.responses = OrderedDict()
         self._partial_responses = defaultdict(list)
+        self.multiple_packet = multiple_packet
 
     def pop(self, id_=None):
         """Pop first received message from the buffer, or the message
@@ -158,20 +171,21 @@ class _ResponseBuffer(object):
                 return
             else:
                 if message.type is message.Type.RESPONSE_VALUE:
-                    id_partial = self._partial_responses[message.id]
-                    id_partial.append(message)
-                    if len(id_partial) >= 2:
-                        penultimate, last = id_partial[-2:]
-                        if (not penultimate.body
-                                and last.body == b"\x00\x01\x00\x00"):
-                            message = RCONMessage(
-                                message.id,
-                                RCONMessage.Type.RESPONSE_VALUE,
-                                b"".join(part.body for part
-                                         in id_partial[:-2]),
-                            )
+                    if self.multiple_packet:
+                        id_partial = self._partial_responses[message.id]
+                        id_partial.append(message)
+                        if len(id_partial) >= 2:
+                            penultimate, last = id_partial[-2:]
+                            if (not penultimate.body
+                                    and last.body == b"\x00\x01\x00\x00"):
+                                message = functools.reduce(operator.add, id_partial[:-2])
+                                self.responses[message.id] = message
+                                del id_partial[:]
+                    else:
+                        if message.id in self.responses:
+                            self.responses[message.id] += message
+                        else:
                             self.responses[message.id] = message
-                            del id_partial[:]
                 else:
                     self.responses[message.id] = message
 
@@ -184,54 +198,35 @@ class _ResponseBuffer(object):
                 del response_list[:]
 
 
-def _ensure(state, value=True):
-    """Decorator to ensure a connection is in a specific state.
-    Use this to wrap a method so that it'll only be executed when
-    certain attributes are set to ``True`` or ``False``. The returned
-    function will raise :exc:`RCONError` if the condition is not met.
-    Additionally, this decorator will modify the docstring of the
-    wrapped function to include a sphinx-style ``:raises:`` directive
-    documenting the valid state for the call.
-    :param str state: the state attribute to check.
-    :param bool value: the required value for the attribute.
-    """
-
-    def decorator(func):
-
-        @functools.wraps(func)
-        def wrapper(instance, *args, **kwargs):
-            if getattr(instance, state) is not value:
-                exc = RCONError("Must {} {}".format(
-                    "be" if value else "not be", state))
-                if hasattr(instance, 'exc'):
-                    exc.__cause__ = instance.exc
-                raise exc
-            return func(instance, *args, **kwargs)
-
-        if not wrapper.__doc__.endswith("\n"):
-            wrapper.__doc__ += "\n"
-        wrapper.__doc__ += ("\n:raises RCONError: {} {}.".format(
-            "if not" if value else "if", state))
-        return wrapper
-
-    return decorator
-
-
 class RCONProtocol(asyncio.Protocol):
     """Implements the RCON protocol"""
 
-    def __init__(self, password, loop, connection_lost_cb=None):
+    class State(enum.IntEnum):
+        CONNECTING, CONNECTED, AUTHENTICATED, CLOSED = range(4)
+
+    def __init__(self, password, loop, connection_lost_cb=None, *, multiple_packet=True):
         self.password = password
-        self.connected = False
-        self._authenticated = False
-        self._connection_lost_cb = connection_lost_cb
         self._loop = loop
+        self._connection_lost_cb = connection_lost_cb
+        self._multiple_packet = multiple_packet
+        self.state = self.State.CONNECTING
         self._transport = None
         self.exc = None
         self._waiters = {}
-        self._buffer = _ResponseBuffer()
+        self._buffer = _ResponseBuffer(self._multiple_packet)
         self._last_id = 0
-        self.test = 0
+
+    class EnsureState:
+        def __init__(self, state):
+            self._state = state
+
+        def __call__(self, func):
+            @functools.wraps(func)
+            async def wrapper(instance, *args, **kwargs):
+                if instance.state != self._state:
+                    raise RCONStateError(self._state, instance.state)
+                return await func(instance, *args, **kwargs)
+            return wrapper
 
     @property
     def last_id(self):
@@ -243,21 +238,20 @@ class RCONProtocol(asyncio.Protocol):
 
     @property
     def authenticated(self):
-        return self._authenticated and self.connected
+        return self.state == self.State.AUTHENTICATED
 
-    @_ensure('connected')
-    @_ensure('authenticated')
+    @EnsureState(State.AUTHENTICATED)
     async def execute(self, command):
         """Executes command on connected RCON"""
         self.last_id += 1
         message = RCONMessage(self.last_id, RCONMessage.Type.EXECCOMMAND, command)
         self._write(message)
-        self._write(RCONMessage.terminator(self.last_id))
+        if self._multiple_packet:
+            self._write(RCONMessage.terminator(self.last_id))
         res = await self._receive(message.id)
         return res.text
 
-    @_ensure('connected')
-    @_ensure('authenticated', False)
+    @EnsureState(State.CONNECTED)
     async def authenticate(self):
         """Authenticates with RCON"""
         self._write(RCONMessage(0, RCONMessage.Type.AUTH, self.password))
@@ -268,13 +262,13 @@ class RCONProtocol(asyncio.Protocol):
 
         self._buffer.clear()
         if res.id == -1:
-            raise RCONAuthenticationError
-        self._authenticated = True
+            raise RCONAuthenticationError(False)
+        self.state = self.State.AUTHENTICATED
 
     def close(self):
         """Closes RCON connection"""
         self._transport.close()
-        self.connected = False
+        self.state = self.State.CLOSED
 
     def _write(self, message):
         self._transport.write(message.encode())
@@ -284,21 +278,23 @@ class RCONProtocol(asyncio.Protocol):
         try:
             await self._waiters[id_]
             return self._buffer.pop(id_)
+        except OSError as e:
+            raise RCONCommunicationError(str(e)) from e
         finally:
             del self._waiters[id_]
 
     def connection_made(self, transport):
-        self.connected = True
+        self.state = self.State.CONNECTED
         self._transport = transport
 
     def connection_lost(self, exc):
-        self.connected = False
+        self.state = self.State.CLOSED
         self.exc = exc
         for waiter in self._waiters.values():
             if exc:
                 waiter.set_exception(exc)
             else:
-                waiter.set_exception(ConnectionAbortedError)
+                waiter.set_exception(TimeoutError("Connection closed before message was received"))
         if self._connection_lost_cb:
             self._connection_lost_cb()
 
@@ -310,14 +306,19 @@ class RCONProtocol(asyncio.Protocol):
                 if len(self._buffer.responses) > cur_count:
                     waiter.set_result(None)
             else:
-                if id_ in self._buffer.responses:
-                    if not waiter.cancelled():
+                if id_ in self._buffer.responses and not waiter.cancelled():
+                    if self._multiple_packet:
                         waiter.set_result(None)
+                    else:
+                        # Gives small amount of time for additional packets to accumulate
+                        self._loop.call_later(1, waiter.set_result, None)
 
 
 class RCON:
     @classmethod
-    async def create(cls, host, port, password, loop=None, auto_reconnect_attempts=-1, auto_reconnect_delay=5):
+    async def create(cls, host, port, password, loop=None,
+                     auto_reconnect_attempts=-1, auto_reconnect_delay=5, *,
+                     multiple_packet=True):
         rcon = cls()
         rcon.host = host
         rcon.port = port
@@ -333,7 +334,8 @@ class RCON:
                 rcon._reconnecting = asyncio.ensure_future(rcon._reconnect(), loop=rcon._loop)
 
         rcon.protocol_factory = lambda: RCONProtocol(password=password, loop=loop,
-                                                     connection_lost_cb=connection_lost)
+                                                     connection_lost_cb=connection_lost,
+                                                     multiple_packet=multiple_packet)
         rcon.protocol = None
 
         await rcon._connect()
@@ -352,7 +354,7 @@ class RCON:
             try:
                 await self._connect()
                 return
-            except OSError as e:
+            except (OSError, RCONCommunicationError):
                 if attempts == 0:
                     raise
                 await asyncio.sleep(self._auto_reconnect_delay)
@@ -362,7 +364,7 @@ class RCON:
             return await self.protocol.execute(command)
         except RCONAuthenticationError:
             raise
-        except (OSError, RCONError):
+        except (RCONCommunicationError, RCONStateError):
             if self._reconnecting:
                 await self._reconnecting
                 return await self(command)
@@ -381,4 +383,3 @@ class RCON:
         """
         self._closing = True
         self.protocol.close()
-
