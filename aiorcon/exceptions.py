@@ -15,6 +15,9 @@ class RCONStateError(RCONError):
 class RCONCommunicationError(RCONError):
     """Used for propagating socket-related errors."""
 
+class RCONClosedError(RCONCommunicationError):
+    """Used when the connection is closed without error by either side."""
+
 
 class RCONTimeoutError(RCONError):
     """Raised when a timeout occurs waiting for a response."""

@@ -5,7 +5,7 @@ import functools
 import operator
 from collections import OrderedDict, defaultdict
 from .exceptions import *
-__version__ = '0.6.0'
+__version__ = '0.6.1'
 
 
 class RCONMessage(object):
@@ -279,7 +279,7 @@ class RCONProtocol(asyncio.Protocol):
             await self._waiters[id_]
             return self._buffer.pop(id_)
         except OSError as e:
-            raise RCONCommunicationError(str(e)) from e
+            raise RCONCommunicationError from e
         finally:
             del self._waiters[id_]
 
@@ -294,7 +294,7 @@ class RCONProtocol(asyncio.Protocol):
             if exc:
                 waiter.set_exception(exc)
             else:
-                waiter.set_exception(TimeoutError("Connection closed before message was received"))
+                waiter.set_exception(RCONClosedError("Connection closed before message was received"))
         if self._connection_lost_cb:
             self._connection_lost_cb()
 
@@ -382,4 +382,6 @@ class RCON:
         Close the connection transport
         """
         self._closing = True
+        if self._reconnecting and not self._reconnecting.done():
+            self._reconnecting.set_exception(RCONClosedError("The RCON connection was closed."))
         self.protocol.close()
