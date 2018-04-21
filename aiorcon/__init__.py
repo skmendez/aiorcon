@@ -5,7 +5,7 @@ import functools
 import operator
 from collections import OrderedDict, defaultdict
 from .exceptions import *
-__version__ = '0.6.1'
+__version__ = '0.6.2'
 
 
 class RCONMessage(object):
@@ -204,11 +204,14 @@ class RCONProtocol(asyncio.Protocol):
     class State(enum.IntEnum):
         CONNECTING, CONNECTED, AUTHENTICATED, CLOSED = range(4)
 
-    def __init__(self, password, loop, connection_lost_cb=None, *, multiple_packet=True):
+    def __init__(self, password, loop, connection_lost_cb=None, *, multiple_packet=True,
+                 timeout=None, close_on_timeout=True):
         self.password = password
         self._loop = loop
         self._connection_lost_cb = connection_lost_cb
         self._multiple_packet = multiple_packet
+        self._timeout = timeout
+        self._close_on_timeout = close_on_timeout
         self.state = self.State.CONNECTING
         self._transport = None
         self.exc = None
@@ -248,7 +251,12 @@ class RCONProtocol(asyncio.Protocol):
         self._write(message)
         if self._multiple_packet:
             self._write(RCONMessage.terminator(self.last_id))
-        res = await self._receive(message.id)
+        try:
+            res = await asyncio.wait_for(self._receive(message.id), timeout=self._timeout)
+        except asyncio.TimeoutError as e:
+            if self._close_on_timeout:
+                self.close()
+            raise RCONTimeoutError from e
         return res.text
 
     @EnsureState(State.CONNECTED)
@@ -318,7 +326,7 @@ class RCON:
     @classmethod
     async def create(cls, host, port, password, loop=None,
                      auto_reconnect_attempts=-1, auto_reconnect_delay=5, *,
-                     multiple_packet=True):
+                     multiple_packet=True, timeout=None):
         rcon = cls()
         rcon.host = host
         rcon.port = port
@@ -335,7 +343,7 @@ class RCON:
 
         rcon.protocol_factory = lambda: RCONProtocol(password=password, loop=loop,
                                                      connection_lost_cb=connection_lost,
-                                                     multiple_packet=multiple_packet)
+                                                     multiple_packet=multiple_packet, timeout=timeout)
         rcon.protocol = None
 
         await rcon._connect()
