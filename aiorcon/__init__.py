@@ -5,7 +5,7 @@ import functools
 import operator
 from collections import OrderedDict, defaultdict
 from .exceptions import *
-__version__ = '0.6.2'
+__version__ = '0.6.3'
 
 
 class RCONMessage(object):
@@ -372,7 +372,7 @@ class RCON:
             return await self.protocol.execute(command)
         except RCONAuthenticationError:
             raise
-        except (RCONCommunicationError, RCONStateError):
+        except RCONError:
             if self._reconnecting:
                 await self._reconnecting
                 return await self(command)
