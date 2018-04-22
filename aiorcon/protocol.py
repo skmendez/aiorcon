@@ -94,7 +94,6 @@ class RCONProtocol(asyncio.Protocol):
     async def _receive(self, id_=None):
         self._waiters[id_] = self._loop.create_future()
         try:
-            await asyncio.sleep(10)
             await self._waiters[id_]
             return self._buffer.pop(id_)
         except OSError as e:
