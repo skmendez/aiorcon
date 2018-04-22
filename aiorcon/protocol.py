@@ -82,9 +82,10 @@ class RCONProtocol(asyncio.Protocol):
             raise RCONAuthenticationError(False)
         self.state = self.State.AUTHENTICATED
 
-    def close(self):
+    def close(self, exc=None):
         """Closes RCON connection"""
         self._transport.close()
+        self.connection_lost(exc)
         self.state = self.State.CLOSED
 
     def _write(self, message):
@@ -93,6 +94,7 @@ class RCONProtocol(asyncio.Protocol):
     async def _receive(self, id_=None):
         self._waiters[id_] = self._loop.create_future()
         try:
+            await asyncio.sleep(10)
             await self._waiters[id_]
             return self._buffer.pop(id_)
         except OSError as e:
@@ -105,13 +107,16 @@ class RCONProtocol(asyncio.Protocol):
         self._transport = transport
 
     def connection_lost(self, exc):
+        if self.State == self.State.CLOSED:
+            return
         self.state = self.State.CLOSED
         self.exc = exc
         for waiter in self._waiters.values():
-            if exc:
-                waiter.set_exception(exc)
-            else:
-                waiter.set_exception(RCONClosedError("Connection closed before message was received"))
+            if not waiter.done():
+                if exc:
+                    waiter.set_exception(exc)
+                else:
+                    waiter.set_exception(RCONClosedError("Connection closed before message was received"))
         if self._connection_lost_cb:
             self._connection_lost_cb()
 
