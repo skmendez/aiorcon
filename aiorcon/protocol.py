@@ -26,7 +26,7 @@ class RCONProtocol(asyncio.Protocol):
         self.exc = None
         self._waiters = {}
         self._buffer = ResponseBuffer(self._multiple_packet)
-        self._last_id = 0
+        self._msg_id = 0
 
     class EnsureState:
         def __init__(self, state):
@@ -41,12 +41,12 @@ class RCONProtocol(asyncio.Protocol):
             return wrapper
 
     @property
-    def last_id(self):
-        return self._last_id
+    def msg_id(self):
+        return self._msg_id
 
-    @last_id.setter
-    def last_id(self, value):
-        self._last_id = (value - 1) % (2 ** 31 - 1) + 1  # Keep values between 1 and 2**31-1
+    @msg_id.setter
+    def msg_id(self, value):
+        self._msg_id = (value - 1) % (2 ** 31 - 1) + 1  # Keep values between 1 and 2**31-1
 
     @property
     def authenticated(self):
@@ -55,17 +55,19 @@ class RCONProtocol(asyncio.Protocol):
     @EnsureState(State.AUTHENTICATED)
     async def execute(self, command):
         """Executes command on connected RCON"""
-        self.last_id += 1
-        message = RCONMessage(self.last_id, RCONMessage.Type.EXECCOMMAND, command)
+        self.msg_id += 1  # Do this first to ensure that all messages have a unique ID
+        message = RCONMessage(self.msg_id, RCONMessage.Type.EXECCOMMAND, command)
         self._write(message)
         if self._multiple_packet:
-            self._write(RCONMessage.terminator(self.last_id))
+            self._write(RCONMessage.terminator(self.msg_id))
         try:
             res = await asyncio.wait_for(self._receive(message.id), timeout=self._timeout)
         except asyncio.TimeoutError as e:
+            exc = RCONTimeoutError
+            exc.__cause__ = e
             if self._close_on_timeout:
-                self.close()
-            raise RCONTimeoutError from e
+                self.close(exc)
+            raise exc
         return res.text
 
     @EnsureState(State.CONNECTED)
@@ -77,7 +79,7 @@ class RCONProtocol(asyncio.Protocol):
         except ConnectionResetError:
             raise RCONAuthenticationError(True)
 
-        self._buffer.clear()
+        self._buffer.clear()  # Sometimes an empty response is sent as well, this gets rid of that
         if res.id == -1:
             raise RCONAuthenticationError(False)
         self.state = self.State.AUTHENTICATED
@@ -85,7 +87,7 @@ class RCONProtocol(asyncio.Protocol):
     def close(self, exc=None):
         """Closes RCON connection"""
         self._transport.close()
-        self.connection_lost(exc)
+        self.connection_lost(exc)  # Calling straight from close ensures that the callback is ran right away
         self.state = self.State.CLOSED
 
     def _write(self, message):
@@ -106,7 +108,7 @@ class RCONProtocol(asyncio.Protocol):
         self._transport = transport
 
     def connection_lost(self, exc):
-        if self.State == self.State.CLOSED:
+        if self.State is self.State.CLOSED:  # In case close was called
             return
         self.state = self.State.CLOSED
         self.exc = exc
@@ -120,7 +122,7 @@ class RCONProtocol(asyncio.Protocol):
             self._connection_lost_cb()
 
     def data_received(self, data):
-        cur_count = len(self._buffer.responses)
+        cur_count = len(self._buffer.responses)  # Used to get first response for _buffer.popitem(None)
         self._buffer.feed(data)
         for id_, waiter in self._waiters.items():
             if id_ is None:

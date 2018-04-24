@@ -48,7 +48,7 @@ class RCON:
                 return
             except RCONAuthenticationError:
                 raise
-            except RCONError:
+            except (RCONError, OSError):
                 if attempts == 0:
                     raise
                 await asyncio.sleep(self._auto_reconnect_delay)
