@@ -65,7 +65,7 @@ class RCONProtocol(asyncio.Protocol):
         except asyncio.TimeoutError as e:
             exc = RCONTimeoutError
             exc.__cause__ = e
-            if self._close_on_timeout:
+            if self._close_on_timeout and self.state != self.State.CLOSED:
                 self.close(exc)
             raise exc
         return res.text

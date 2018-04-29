@@ -1,5 +1,4 @@
 import asyncio
-import traceback
 import logging
 from aiorcon.exceptions import RCONAuthenticationError, RCONError, RCONClosedError
 from aiorcon.protocol import RCONProtocol
@@ -10,14 +9,14 @@ class RCON:
     @classmethod
     async def create(cls, host, port, password, loop=None,
                      auto_reconnect_attempts=-1, auto_reconnect_delay=5, *,
-                     multiple_packet=True, timeout=None):
+                     multiple_packet=True, timeout=None, auto_reconnect_cb=None):
         rcon = cls()
         rcon.host = host
         rcon.port = port
         rcon._loop = loop or asyncio.get_event_loop()
         rcon._auto_reconnect_attempts = auto_reconnect_attempts
         rcon._auto_reconnect_delay = auto_reconnect_delay
-        rcon._creating_connection = None
+        rcon._auto_reconnect_cb = auto_reconnect_cb
         rcon._reconnecting = False
         rcon._closing = False
 
@@ -39,32 +38,40 @@ class RCON:
         self.protocol = protocol
 
     async def _reconnect(self):
-        attempts = self._auto_reconnect_attempts
-        while attempts:
-            if self._auto_reconnect_attempts > 0:
-                attempts -= 1
+        attempt = 0
+        while attempt < self._auto_reconnect_attempts or self._auto_reconnect_attempts == -1:
+            attempt += 1
+            if self._auto_reconnect_cb:
+                self._auto_reconnect_cb(attempt)
             try:
                 await self._connect()
+                self._auto_reconnect_cb(0)
                 return
             except RCONAuthenticationError:
+                self._auto_reconnect_cb(-1)
                 raise
             except (RCONError, OSError):
-                if attempts == 0:
+                log.debug("Error:", exc_info=True)
+                if attempt == self._auto_reconnect_attempts:
+                    self._auto_reconnect_cb(-1)
                     raise
                 await asyncio.sleep(self._auto_reconnect_delay)
 
     async def __call__(self, command):
-        try:
-            return await self.protocol.execute(command)
-        except RCONAuthenticationError:
-            raise
-        except RCONError:
-            log.debug(traceback.format_exc())
-            if self._reconnecting:
-                await self._reconnecting
-                return await self(command)
-            else:
+        if self._reconnecting and self._reconnecting.done():
+            self._reconnecting = False
+        while True:
+            try:
+                return await self.protocol.execute(command)
+            except RCONAuthenticationError:
                 raise
+            except RCONError:
+                log.debug("Reconnecting due to error", exc_info=True)
+                if self._reconnecting:
+                    await self._reconnecting
+                    self._reconnecting = False
+                else:
+                    raise
 
     def __getattr__(self, name):
         return getattr(self.protocol, name)

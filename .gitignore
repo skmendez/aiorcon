@@ -45,3 +45,4 @@ virtualenv.py
 .python-version
 .pytest_cache
 .vscode
+auto_setup.py
