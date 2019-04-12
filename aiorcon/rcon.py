@@ -24,7 +24,7 @@ class RCON:
             if rcon._auto_reconnect_attempts and not rcon._closing:
                 rcon._reconnecting = asyncio.ensure_future(rcon._reconnect(), loop=rcon._loop)
 
-        rcon.protocol_factory = lambda: RCONProtocol(password=password, loop=loop,
+        rcon.protocol_factory = lambda: RCONProtocol(password=password, loop=rcon._loop,
                                                      connection_lost_cb=connection_lost,
                                                      multiple_packet=multiple_packet, timeout=timeout)
         rcon.protocol = None
