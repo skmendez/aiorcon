@@ -31,20 +31,20 @@ you want to send. After awaiting the call you get the output of the command.
 .. code-block:: python
   :emphasize-lines: 7,10
 
-    import aiorcon
-    import asyncio
+  import aiorcon
+  import asyncio
 
-    async def main(loop):
+  async def main(loop):
 
-        # initialize the RCON connection with ip, port, password and the event loop.
-        rcon = await aiorcon.RCON.create("192.168.2.137", 27015, "rconpassword", loop)
+      # initialize the RCON connection with ip, port, password and the event loop.
+      rcon = await aiorcon.RCON.create("192.168.2.137", 27015, "rconpassword", loop)
 
-        # send a command
-        stats = await(rcon("stats"))
-        print(stats)
+      # send a command
+      stats = await(rcon("stats"))
+      print(stats)
 
-        # close the connection in the end
-        rcon.close()
+      # close the connection in the end
+      rcon.close()
 
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main(loop))
+  loop = asyncio.get_event_loop()
+  loop.run_until_complete(main(loop))
