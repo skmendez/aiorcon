@@ -17,6 +17,8 @@ Installation
 
 The easiest way is to install via pip:
 
+.. code-block::
+
     pip install aiorcon
 
 Usage Example
@@ -25,6 +27,9 @@ Usage Example
 Using aiorcon is pretty simple. First you have to create a RCON Object with
 the `create` method. The RCON Object itself is now callable with the command
 you want to send. After awaiting the call you get the output of the command.
+
+.. code-block:: python
+  :emphasize-lines: 7,10
 
     import aiorcon
     import asyncio
